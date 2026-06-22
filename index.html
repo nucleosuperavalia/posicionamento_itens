@@ -284,7 +284,8 @@
       itemInfo: null,
       sessionId: criarId('sessao'),
       drag: { item: null, from: null, oldIndex: null, editing: false },
-      renderTimer: null
+      renderTimer: null,
+      carregandoEstado: false
     };
 
     const el = {
@@ -318,8 +319,8 @@
     document.getElementById('btnCancelarModal').addEventListener('click', cancelarModal);
     document.getElementById('btnConfirmarModal').addEventListener('click', confirmarModal);
     el.filtroItensNovos.addEventListener('input', renderItensNovos);
-    el.avaliador.addEventListener('change', () => { limparTrabalho(); popularComponentes(); popularAnos(); popularAnosItensNovos(); popularDescritores(); renderTudo(); });
-    el.componente.addEventListener('change', () => { limparTrabalho(); popularAnos(); popularAnosItensNovos(); popularDescritores(); renderTudo(); });
+    el.avaliador.addEventListener('change', async () => { limparTrabalho(); popularComponentes(); popularAnos(); popularAnosItensNovos(); popularDescritores(); renderTudo(); await carregarEstadoSalvoAtual(); });
+    el.componente.addEventListener('change', async () => { limparTrabalho(); popularAnos(); popularAnosItensNovos(); popularDescritores(); renderTudo(); await carregarEstadoSalvoAtual(); });
     el.btnAdicionarDescritor.addEventListener('click', adicionarDescritorAtual);
     el.descritor.addEventListener('keydown', event => {
       if (event.key === 'Enter') {
@@ -956,6 +957,167 @@
       } catch (err) {
         status('Erro ao salvar no Drive: ' + err.message, 'error');
       }
+    }
+
+
+    async function carregarEstadoSalvoAtual() {
+      const avaliador = el.avaliador.value;
+      const componente = el.componente.value;
+      if (!avaliador || !APPS_SCRIPT_URL || APPS_SCRIPT_URL.includes('COLE_AQUI')) return;
+      state.carregandoEstado = true;
+      status('Carregando últimos posicionamentos salvos...', 'saving');
+      try {
+        const url = `${APPS_SCRIPT_URL}?action=estado&avaliador=${encodeURIComponent(avaliador)}&componente=${encodeURIComponent(componente || '')}&ts=${Date.now()}`;
+        const resp = await fetch(url);
+        const json = await resp.json();
+        if (!json.ok) throw new Error(json.error || 'Erro ao carregar estado salvo.');
+        if (json.estado && json.estado.hasState) {
+          aplicarEstadoSalvo(json.estado);
+          status('Últimos posicionamentos do avaliador carregados.');
+        } else {
+          status('Sem posicionamentos salvos para este avaliador/componente.');
+        }
+      } catch (err) {
+        status('Não foi possível carregar os posicionamentos salvos: ' + err.message, 'error');
+      } finally {
+        state.carregandoEstado = false;
+      }
+    }
+
+    function aplicarEstadoSalvo(estado) {
+      if (!estado || !estado.hasState) return;
+      const componenteEstado = texto(estado.componente || '');
+      if (componenteEstado && [...el.componente.options].some(opt => opt.value === componenteEstado) && el.componente.value !== componenteEstado) {
+        el.componente.value = componenteEstado;
+        popularAnos();
+        popularAnosItensNovos();
+      }
+
+      if (Array.isArray(estado.anosSelecionados) && estado.anosSelecionados.length) {
+        ativarBotoesAno(el.anos, estado.anosSelecionados);
+      }
+
+      popularDescritores(false);
+      state.selectedDescritores.clear();
+      (estado.descritoresSelecionados || []).filter(Boolean).forEach(d => state.selectedDescritores.add(d));
+      renderDescritoresSelecionados();
+
+      state.itemInfo = null;
+      state.selectedAnchors.clear();
+      const refsPorCodigo = new Map();
+      (estado.itensReferencia || []).forEach(ref => {
+        const normalizado = normalizarReferenciaSalva(ref);
+        if (normalizado && normalizado.codigo) refsPorCodigo.set(normalizado.codigo, normalizado);
+      });
+      (estado.listaFinal || []).forEach(entry => {
+        if (String(entry.tipo || '') !== 'anchor') return;
+        const codigo = texto(entry.codigo || '');
+        const ref = buscarParametrizadoPorCodigo(codigo) || refsPorCodigo.get(codigo);
+        if (ref && ref.codigo) refsPorCodigo.set(ref.codigo, ref);
+      });
+      refsPorCodigo.forEach((ref, codigo) => state.selectedAnchors.set(codigo, ref));
+
+      renderGrafico();
+      reconstruirListaSelecionadosSalva(estado, refsPorCodigo);
+      renderItensNovos();
+      atualizarContadores();
+      renderItemInfo();
+    }
+
+    function ativarBotoesAno(container, anosSalvos) {
+      const alvo = new Set((anosSalvos || []).map(texto).filter(Boolean));
+      if (!alvo.size) return;
+      container.querySelectorAll('.year-pill').forEach(botao => {
+        const ativo = alvo.has(botao.dataset.ano);
+        botao.classList.toggle('active', ativo);
+        botao.setAttribute('aria-pressed', ativo ? 'true' : 'false');
+      });
+    }
+
+    function normalizarReferenciaSalva(ref) {
+      if (!ref) return null;
+      const codigo = texto(ref.codigo || ref.Codigo || ref.codigoItem || '');
+      if (!codigo) return null;
+      const original = buscarParametrizadoPorCodigo(codigo);
+      if (original) return original;
+      return {
+        codigo,
+        ano: texto(ref.ano || ref.Ano || ''),
+        componente: componenteDisplay(ref.componente || ref.Componente || el.componente.value),
+        descritor: texto(ref.descritor || ref.Descritor || ''),
+        link: texto(ref.link || ref.Link || ''),
+        a: numero(ref.a ?? ref.A),
+        b: numero(ref.b ?? ref.B),
+        c: numero(ref.c ?? ref.C)
+      };
+    }
+
+    function reconstruirListaSelecionadosSalva(estado, refsPorCodigo) {
+      el.listaSelecionados.innerHTML = '';
+      const registrosPorCodigo = new Map((estado.registros || []).map(r => [texto(r.codigoNovo || r.codigo || ''), r]));
+      const lista = Array.isArray(estado.listaFinal) ? estado.listaFinal : [];
+      const usadosNovos = new Set();
+
+      if (lista.length) {
+        lista.forEach(entry => {
+          const tipo = texto(entry.tipo || '');
+          const codigo = texto(entry.codigo || '');
+          if (!codigo) return;
+          if (tipo === 'anchor') {
+            const ref = state.selectedAnchors.get(codigo) || refsPorCodigo.get(codigo) || buscarParametrizadoPorCodigo(codigo);
+            if (ref) el.listaSelecionados.appendChild(criarCardReferencia(ref));
+          } else if (tipo === 'novo') {
+            const registro = registrosPorCodigo.get(codigo);
+            const base = buscarNovoPorCodigo(codigo) || { codigo, ano: '', descritor: '', link: '', pdf: '' };
+            if (registro) {
+              el.listaSelecionados.appendChild(criarCardNovoPosicionado(base, registro));
+              usadosNovos.add(codigo);
+            }
+          }
+        });
+      }
+
+      if (!lista.length) {
+        [...state.selectedAnchors.values()].sort((a,b) => (a.b-b.b) || (a.a-b.a) || (a.c-b.c)).forEach(ref => el.listaSelecionados.appendChild(criarCardReferencia(ref)));
+      }
+
+      (estado.registros || []).forEach(registro => {
+        const codigo = texto(registro.codigoNovo || '');
+        if (!codigo || usadosNovos.has(codigo)) return;
+        const base = buscarNovoPorCodigo(codigo) || { codigo, ano: '', descritor: '', link: '', pdf: '' };
+        el.listaSelecionados.appendChild(criarCardNovoPosicionado(base, registro));
+        usadosNovos.add(codigo);
+      });
+
+      if (!el.listaSelecionados.children.length) {
+        el.listaSelecionados.innerHTML = '<div class="empty">Clique nas bolinhas do descritor no gráfico para montar a lista de referências.</div>';
+      }
+    }
+
+    function criarCardNovoPosicionado(base, registro) {
+      const div = document.createElement('div');
+      div.className = 'item-card novo-card';
+      div.dataset.tipo = 'novo';
+      div.dataset.codigo = texto(base.codigo || registro.codigoNovo || '');
+      div.dataset.ano = texto(base.ano || '');
+      div.dataset.descritor = texto(base.descritor || '');
+      div.dataset.link = texto(base.link || '');
+      div.dataset.pdf = texto(base.pdf || '');
+      div.dataset.registroId = texto(registro.registroId || '') || criarId('reg');
+      div.dataset.posicionamentoB = texto(registro.posicionamentoB || '');
+      div.dataset.parametroA = texto(registro.parametroA || '');
+      div.dataset.parametroC = texto(registro.parametroC || '');
+      div.dataset.comentarios = texto(registro.comentarios || '');
+      div.dataset.codigoReferenciaAnterior = texto(registro.codigoReferenciaAnterior || '');
+      div.dataset.bReferenciaAnterior = texto(registro.bReferenciaAnterior || '');
+      div.dataset.codigoReferenciaSeguinte = texto(registro.codigoReferenciaSeguinte || '');
+      div.dataset.bReferenciaSeguinte = texto(registro.bReferenciaSeguinte || '');
+      atualizarVisualNovo(div);
+      return div;
+    }
+
+    function buscarNovoPorCodigo(codigo) {
+      return state.dados.novos.find(item => item.codigo === codigo) || null;
     }
 
     function limparTrabalho() {
